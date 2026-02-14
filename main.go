@@ -9,36 +9,49 @@ import (
 	"github.com/gorilla/websocket"
 )
 
-var upgrader = websocket.Upgrader{CheckOrigin: func(r *http.Request) bool { return true }}
+// Настройка Upgrader: преобразует обычный HTTP-запрос в WebSocket-соединение
+var upgrader = websocket.Upgrader{
+	CheckOrigin: func(r *http.Request) bool { return true }}
 
+// Transfer структура для передачи файла между пользователями
 type Transfer struct {
-	pr *io.PipeReader
-	pw *io.PipeWriter
+	pr *io.PipeReader // Сторона, которая читает (получатель)
+	pw *io.PipeWriter // Сторона, которая пишет (отправитель)
 }
 
 var (
-	clients   = make(map[string]*websocket.Conn)
+	// Карта активных WebSocket-клиентов: ID пользователя -> его соединение
+	clients = make(map[string]*websocket.Conn)
+	// Карта активных передач: ID получателя
 	transfers = make(map[string]*Transfer)
-	mu        sync.Mutex
+	// Мьютекс для безопасного доступа к картам из разных потоков (горутин)
+	mu sync.Mutex
 )
 
 func main() {
-	http.HandleFunc("/", handleHome)
-	http.HandleFunc("/ws", handleWS)
-	http.HandleFunc("/stream", handleStream)
+	// Регистрация маршрутов
+	http.HandleFunc("/", handleHome)         // Главная страница с интерфейсом
+	http.HandleFunc("/ws", handleWS)         // Сигнальный сервер (кто в сети, уведомления)
+	http.HandleFunc("/stream", handleStream) // Канал для самой передачи байтов файла
 	fmt.Println("🚀 Сервер запущен: http://localhost:8080")
-	http.ListenAndServe(":8080", nil)
+	// Запуск сервера на порту 8080
+	if err := http.ListenAndServe(":8080", nil); err != nil {
+		fmt.Println("Ошибка старта:", err)
+	}
 }
 
+// handleWS управляет списком пользователей и пересылкой сигналов (offer/accept)
 func handleWS(w http.ResponseWriter, r *http.Request) {
 	conn, _ := upgrader.Upgrade(w, r, nil)
+	// Генерируем ID пользователя на основе его сетевого порта (последние 5 символов)
 	id := fmt.Sprintf("User-%s", r.RemoteAddr[len(r.RemoteAddr)-5:])
 	mu.Lock()
 	clients[id] = conn
+	// Сразу сообщаем клиенту его собственный ID
 	conn.WriteJSON(map[string]string{"type": "welcome", "id": id})
 	broadcast()
 	mu.Unlock()
-
+	// Удаление клиента при отключении
 	defer func() {
 		mu.Lock()
 		delete(clients, id)
@@ -46,7 +59,7 @@ func handleWS(w http.ResponseWriter, r *http.Request) {
 		mu.Unlock()
 		conn.Close()
 	}()
-
+	// Цикл прослушивания входящих сообщений (сигналов) от клиента
 	for {
 		var msg map[string]string
 		if err := conn.ReadJSON(&msg); err != nil {
@@ -61,6 +74,7 @@ func handleWS(w http.ResponseWriter, r *http.Request) {
 	}
 }
 
+// broadcast рассылает актуальный список всех ID пользователей всем подключенным
 func broadcast() {
 	var list []string
 	for id := range clients {
@@ -71,6 +85,7 @@ func broadcast() {
 	}
 }
 
+// handleHome отдает HTML, CSS и JavaScript фронтенд приложения
 func handleHome(w http.ResponseWriter, r *http.Request) {
 	w.Header().Set("Content-Type", "text/html; charset=utf-8")
 	fmt.Fprint(w, `
@@ -95,7 +110,7 @@ func handleHome(w http.ResponseWriter, r *http.Request) {
     </style>
 </head>
 <body>
-
+<!-- Уведомление о входящем файле -->
 <div id="notif" class="card">
     <strong id="notif-txt"></strong>
     <div style="margin-top:15px; display: flex; justify-content: center;">
@@ -103,7 +118,7 @@ func handleHome(w http.ResponseWriter, r *http.Request) {
         <button class="btn-no" onclick="reply(false)">Отмена</button>
     </div>
 </div>
-
+<!-- Основной интерфейс -->
 <div class="card">
     <h3 style="margin-top:0">Люди в сети:</h3>
     <div id="list">Загрузка...</div>
@@ -128,14 +143,14 @@ func handleHome(w http.ResponseWriter, r *http.Request) {
         const i = Math.floor(Math.log(bytes) / Math.log(k));
         return parseFloat((bytes / Math.pow(k, i)).toFixed(dm)) + ' ' + sizes[i];
     }
-
+	// Обновление полоски прогресса
     function updateProgress(percent) {
         const cont = document.getElementById('p-cont');
         const bar = document.getElementById('p-bar');
         cont.style.display = 'block';
         bar.style.width = percent + '%';
     }
-
+	// Обработка сообщений от сервера по WebSocket
     ws.onmessage = (e) => {
         const d = JSON.parse(e.data);
         if(d.type === 'welcome') {
@@ -155,7 +170,6 @@ func handleHome(w http.ResponseWriter, r *http.Request) {
 
         if(d.type === 'offer') {
             currentOffer = d;
-            // ТЕПЕРЬ ТУТ ВЫВОДИТСЯ РАЗМЕР
             document.getElementById('notif-txt').innerHTML = 
                 "От: " + d.from + "<br>" +
                 "Файл: <b>" + d.name + "</b><br>" +
@@ -165,7 +179,7 @@ func handleHome(w http.ResponseWriter, r *http.Request) {
         }
 
         if(d.type === 'accept') {
-            uploadFile(d.from);
+            uploadFile(d.from); // Если получатель нажал Принять, начинаем POST-отправку
         }
     };
 
@@ -234,6 +248,7 @@ func handleHome(w http.ResponseWriter, r *http.Request) {
 `)
 }
 
+// handleStream связывает POST-отправителя и GET-получателя через Pipe в реальном времени
 func handleStream(w http.ResponseWriter, r *http.Request) {
 	id := r.URL.Query().Get("to")
 	mu.Lock()
@@ -246,12 +261,14 @@ func handleStream(w http.ResponseWriter, r *http.Request) {
 	mu.Unlock()
 
 	if r.Method == "POST" {
+		// ОТПРАВИТЕЛЬ льет данные в PipeWriter
 		io.Copy(t.pw, r.Body)
 		t.pw.Close()
 		mu.Lock()
 		delete(transfers, id)
 		mu.Unlock()
 	} else {
+		// ПОЛУЧАТЕЛЬ читает данные из PipeReader
 		w.Header().Set("Content-Disposition", "attachment; filename="+r.URL.Query().Get("name"))
 		w.Header().Set("Content-Length", r.URL.Query().Get("size"))
 		io.Copy(w, t.pr)
