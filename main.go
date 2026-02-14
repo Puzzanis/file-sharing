@@ -3,157 +3,257 @@ package main
 import (
 	"fmt"
 	"io"
-	"math/rand"
 	"net/http"
 	"sync"
-	"time"
+
+	"github.com/gorilla/websocket"
 )
 
+var upgrader = websocket.Upgrader{CheckOrigin: func(r *http.Request) bool { return true }}
+
 type Transfer struct {
-	pipeReader *io.PipeReader
-	pipeWriter *io.PipeWriter
-	fileName   chan string
-	fileSize   chan int64
+	pr *io.PipeReader
+	pw *io.PipeWriter
 }
 
 var (
+	clients   = make(map[string]*websocket.Conn)
 	transfers = make(map[string]*Transfer)
 	mu        sync.Mutex
 )
 
-// Генерация случайного кода из 4 цифр
-func generateCode() string {
-	rand.Seed(time.Now().UnixNano())
-	return fmt.Sprintf("%04d", rand.Intn(10000))
-}
-
 func main() {
 	http.HandleFunc("/", handleHome)
+	http.HandleFunc("/ws", handleWS)
 	http.HandleFunc("/stream", handleStream)
-	http.HandleFunc("/get-code", func(w http.ResponseWriter, r *http.Request) {
-		fmt.Fprint(w, generateCode())
-	})
-
-	fmt.Println("Сервер обмена запущен на http://localhost:8080")
+	fmt.Println("🚀 Сервер запущен: http://localhost:8080")
 	http.ListenAndServe(":8080", nil)
+}
+
+func handleWS(w http.ResponseWriter, r *http.Request) {
+	conn, _ := upgrader.Upgrade(w, r, nil)
+	id := fmt.Sprintf("User-%s", r.RemoteAddr[len(r.RemoteAddr)-5:])
+	mu.Lock()
+	clients[id] = conn
+	conn.WriteJSON(map[string]string{"type": "welcome", "id": id})
+	broadcast()
+	mu.Unlock()
+
+	defer func() {
+		mu.Lock()
+		delete(clients, id)
+		broadcast()
+		mu.Unlock()
+		conn.Close()
+	}()
+
+	for {
+		var msg map[string]string
+		if err := conn.ReadJSON(&msg); err != nil {
+			break
+		}
+		mu.Lock()
+		if target, ok := clients[msg["to"]]; ok {
+			msg["from"] = id
+			target.WriteJSON(msg)
+		}
+		mu.Unlock()
+	}
+}
+
+func broadcast() {
+	var list []string
+	for id := range clients {
+		list = append(list, id)
+	}
+	for _, c := range clients {
+		c.WriteJSON(map[string]interface{}{"type": "list", "users": list})
+	}
 }
 
 func handleHome(w http.ResponseWriter, r *http.Request) {
 	w.Header().Set("Content-Type", "text/html; charset=utf-8")
 	fmt.Fprint(w, `
-		<style>
-			body { font-family: sans-serif; display: flex; justify-content: center; padding-top: 50px; background: #f4f7f6; }
-			.card { background: white; padding: 2rem; border-radius: 12px; box-shadow: 0 4px 15px rgba(0,0,0,0.1); width: 350px; }
-			input, button { width: 100%; padding: 12px; margin: 8px 0; border-radius: 6px; border: 1px solid #ddd; box-sizing: border-box; }
-			button { background: #007bff; color: white; border: none; cursor: pointer; font-weight: bold; }
-			button:hover { background: #0056b3; }
-			.code-display { font-size: 24px; font-weight: bold; text-align: center; color: #007bff; margin: 10px 0; letter-spacing: 5px; }
-			#progress-container { width: 100%; background: #eee; display: none; height: 8px; border-radius: 4px; overflow: hidden; }
-			#progress-bar { width: 0%; height: 100%; background: #28a745; transition: width 0.2s; }
-		</style>
+<!DOCTYPE html>
+<html>
+<head>
+    <meta charset="utf-8">
+    <title>Go File Share</title>
+    <style>
+        body { font-family: 'Segoe UI', Tahoma, sans-serif; background: #f0f2f5; display: flex; flex-direction: column; align-items: center; padding: 20px; }
+        .card { background: white; padding: 20px; border-radius: 12px; width: 380px; box-shadow: 0 4px 10px rgba(0,0,0,0.1); margin-top: 15px; border: 1px solid #ddd; }
+        .user { padding: 12px; border-bottom: 1px solid #f0f0f0; display: flex; justify-content: space-between; align-items: center; }
+        .user:last-child { border-bottom: none; }
+        #notif { display:none; border: 2px solid #28a745; background: #f1f8e9; }
+        button { cursor: pointer; border: none; padding: 8px 15px; border-radius: 6px; background: #007bff; color: white; font-weight: bold; }
+        button:hover { background: #0056b3; }
+        .btn-ok { background: #28a745; margin-right: 10px; } 
+        .btn-no { background: #dc3545; }
+        #status { font-size: 14px; color: #555; margin-top: 15px; text-align: center; min-height: 20px; }
+        .progress-container { width: 100%; background: #e0e0e0; border-radius: 10px; height: 12px; margin-top: 10px; display: none; overflow: hidden; }
+        .progress-bar { width: 0%; height: 100%; background: #28a745; transition: width 0.1s linear; }
+    </style>
+</head>
+<body>
 
-		<div class="card">
-			<h2 style="text-align:center">File Drop</h2>
-			
-			<div id="setup-area">
-				<button onclick="initSend()" style="background:#28a745">Я хочу отправить файл</button>
-				<button onclick="document.getElementById('receive-area').style.display='block'; this.style.display='none'">У меня есть код</button>
-			</div>
+<div id="notif" class="card">
+    <strong id="notif-txt"></strong>
+    <div style="margin-top:15px; display: flex; justify-content: center;">
+        <button class="btn-ok" onclick="reply(true)">Принять</button>
+        <button class="btn-no" onclick="reply(false)">Отмена</button>
+    </div>
+</div>
 
-			<div id="send-area" style="display:none">
-				<p>Ваш код для получателя:</p>
-				<div id="my-code" class="code-display">----</div>
-				<input type="file" id="file">
-				<button onclick="startUpload()">Начать передачу</button>
-			</div>
+<div class="card">
+    <h3 style="margin-top:0">Люди в сети:</h3>
+    <div id="list">Загрузка...</div>
+    <input type="file" id="file-input" style="display:none">
+    
+    <div id="p-cont" class="progress-container">
+        <div id="p-bar" class="progress-bar"></div>
+    </div>
+    <div id="status">Инициализация...</div>
+</div>
 
-			<div id="receive-area" style="display:none">
-				<input type="text" id="join-code" placeholder="Введите 4 цифры">
-				<button onclick="startDownload()">Скачать файл</button>
-			</div>
+<script>
+    const ws = new WebSocket('ws://' + location.host + '/ws');
+    let myId, currentOffer = null, fileToSend = null;
 
-			<div id="progress-container"><div id="progress-bar"></div></div>
-			<p id="status" style="text-align:center; font-size: 14px; color: #666"></p>
-		</div>
+    // Функция для красивого вывода размера (Байты -> Кб/Мб/Гб)
+    function formatBytes(bytes, decimals = 2) {
+        if (bytes === 0) return '0 Bytes';
+        const k = 1024;
+        const dm = decimals < 0 ? 0 : decimals;
+        const sizes = ['Bytes', 'KB', 'MB', 'GB', 'TB'];
+        const i = Math.floor(Math.log(bytes) / Math.log(k));
+        return parseFloat((bytes / Math.pow(k, i)).toFixed(dm)) + ' ' + sizes[i];
+    }
 
-		<script>
-			let activeCode = "";
+    function updateProgress(percent) {
+        const cont = document.getElementById('p-cont');
+        const bar = document.getElementById('p-bar');
+        cont.style.display = 'block';
+        bar.style.width = percent + '%';
+    }
 
-			async function initSend() {
-				const res = await fetch('/get-code');
-				activeCode = await res.text();
-				document.getElementById('my-code').innerText = activeCode;
-				document.getElementById('send-area').style.display = 'block';
-				document.getElementById('setup-area').style.display = 'none';
-			}
+    ws.onmessage = (e) => {
+        const d = JSON.parse(e.data);
+        if(d.type === 'welcome') {
+            myId = d.id;
+            document.getElementById('status').innerText = "Ваш ID: " + myId;
+        }
+        
+        if(d.type === 'list') {
+            const listDiv = document.getElementById('list');
+            listDiv.innerHTML = "";
+            d.users.forEach(id => {
+                const isMe = id === myId;
+                listDiv.innerHTML += '<div class="user"><span>' + id + (isMe ? ' <strong>(Вы)</strong>' : '') + '</span>' + 
+                    (!isMe ? '<button onclick="askSend(\''+id+'\')">Файл</button>' : '') + '</div>';
+            });
+        }
 
-			function startUpload() {
-				const fileInput = document.getElementById('file');
-				if(!fileInput.files[0]) return alert("Выберите файл!");
-				
-				const file = fileInput.files[0];
-				const xhr = new XMLHttpRequest();
-				const bar = document.getElementById('progress-bar');
-				document.getElementById('progress-container').style.display = 'block';
+        if(d.type === 'offer') {
+            currentOffer = d;
+            // ТЕПЕРЬ ТУТ ВЫВОДИТСЯ РАЗМЕР
+            document.getElementById('notif-txt').innerHTML = 
+                "От: " + d.from + "<br>" +
+                "Файл: <b>" + d.name + "</b><br>" +
+                "Размер: <span style='color:#007bff'>" + formatBytes(parseInt(d.size)) + "</span>";
+            
+            document.getElementById('notif').style.display = 'block';
+        }
 
-				xhr.upload.onprogress = (e) => {
-					const percent = Math.round((e.loaded / e.total) * 100);
-					bar.style.width = percent + '%';
-					document.getElementById('status').innerText = "Отправка: " + percent + "%";
-				};
+        if(d.type === 'accept') {
+            uploadFile(d.from);
+        }
+    };
 
-				xhr.open("POST", "/stream?code=" + activeCode + "&name=" + encodeURIComponent(file.name) + "&size=" + file.size);
-				xhr.send(file);
-				document.getElementById('status').innerText = "Ожидание подключения получателя...";
-			}
+    function askSend(toId) {
+        const input = document.getElementById('file-input');
+        input.onchange = () => {
+            if (input.files.length === 0) return;
+            fileToSend = input.files[0];
+            
+            // Отправляем имя и размер через WebSocket
+            ws.send(JSON.stringify({
+                type: 'offer', 
+                to: toId, 
+                name: fileToSend.name, 
+                size: fileToSend.size.toString() 
+            }));
+            document.getElementById('status').innerText = "Ждем ответа от " + toId + "...";
+        };
+        input.click();
+    }
 
-			function startDownload() {
-				const code = document.getElementById('join-code').value;
-				if(!code) return alert("Введите код!");
-				window.location.href = "/stream?code=" + code;
-			}
-		</script>
-	`)
+    function reply(ok) {
+        document.getElementById('notif').style.display = 'none';
+        if(ok && currentOffer) {
+            ws.send(JSON.stringify({type: 'accept', to: currentOffer.from}));
+            
+            const url = "/stream?to=" + myId + "&name=" + encodeURIComponent(currentOffer.name) + "&size=" + currentOffer.size;
+            const link = document.createElement('a');
+            link.href = url;
+            link.download = currentOffer.name;
+            document.body.appendChild(link);
+            link.click();
+            document.body.removeChild(link);
+            
+            document.getElementById('status').innerText = "Получение файла...";
+        }
+        currentOffer = null;
+    }
+
+    function uploadFile(toId) {
+        if(!fileToSend) return;
+        const xhr = new XMLHttpRequest();
+        
+        xhr.upload.onprogress = (e) => {
+            if (e.lengthComputable) {
+                const percent = Math.round((e.loaded / e.total) * 100);
+                updateProgress(percent);
+                document.getElementById('status').innerText = "Отправка: " + percent + "% (" + formatBytes(e.loaded) + ")";
+            }
+        };
+
+        xhr.open("POST", "/stream?to=" + toId + "&name=" + encodeURIComponent(fileToSend.name) + "&size=" + fileToSend.size);
+        xhr.onload = () => {
+            document.getElementById('status').innerText = "✅ Файл успешно отправлен!";
+            setTimeout(() => { 
+                document.getElementById('p-cont').style.display = 'none'; 
+                document.getElementById('p-bar').style.width = '0%';
+            }, 3000);
+            fileToSend = null;
+        };
+        xhr.send(fileToSend);
+    }
+</script>
+</body>
+</html>
+`)
 }
 
 func handleStream(w http.ResponseWriter, r *http.Request) {
-	// Код функции handleStream остается таким же, как в предыдущем ответе
-	code := r.URL.Query().Get("code")
+	id := r.URL.Query().Get("to")
 	mu.Lock()
-	t, exists := transfers[code]
-	if !exists {
+	t, ok := transfers[id]
+	if !ok {
 		pr, pw := io.Pipe()
-		t = &Transfer{
-			pipeReader: pr,
-			pipeWriter: pw,
-			fileName:   make(chan string, 1),
-			fileSize:   make(chan int64, 1),
-		}
-		transfers[code] = t
+		t = &Transfer{pr: pr, pw: pw}
+		transfers[id] = t
 	}
 	mu.Unlock()
 
-	if r.Method == http.MethodPost {
-		t.fileName <- r.URL.Query().Get("name")
-		var size int64
-		fmt.Sscanf(r.URL.Query().Get("size"), "%d", &size)
-		t.fileSize <- size
-
-		io.Copy(t.pipeWriter, r.Body)
-		t.pipeWriter.Close()
-
+	if r.Method == "POST" {
+		io.Copy(t.pw, r.Body)
+		t.pw.Close()
 		mu.Lock()
-		delete(transfers, code)
+		delete(transfers, id)
 		mu.Unlock()
 	} else {
-		select {
-		case name := <-t.fileName:
-			size := <-t.fileSize
-			w.Header().Set("Content-Disposition", "attachment; filename="+name)
-			w.Header().Set("Content-Length", fmt.Sprintf("%d", size))
-			io.Copy(w, t.pipeReader)
-		case <-time.After(30 * time.Minute): // Тайм-аут, если никто не пришел
-			http.Error(w, "Transfer expired", 404)
-		}
+		w.Header().Set("Content-Disposition", "attachment; filename="+r.URL.Query().Get("name"))
+		w.Header().Set("Content-Length", r.URL.Query().Get("size"))
+		io.Copy(w, t.pr)
 	}
 }
