@@ -185,6 +185,9 @@ func handleHome(w http.ResponseWriter, r *http.Request) {
 
     function askSend(toId) {
         const input = document.getElementById('file-input');
+		// ВАЖНО: Сбрасываем значение инпута, чтобы onchange срабатывал 
+		// даже если мы выбираем тот же самый файл второй раз подряд
+		input.value = '';
         input.onchange = () => {
             if (input.files.length === 0) return;
             fileToSend = input.files[0];
@@ -251,8 +254,10 @@ func handleHome(w http.ResponseWriter, r *http.Request) {
 // handleStream связывает POST-отправителя и GET-получателя через Pipe в реальном времени
 func handleStream(w http.ResponseWriter, r *http.Request) {
 	id := r.URL.Query().Get("to")
+
 	mu.Lock()
 	t, ok := transfers[id]
+	// Если передачи нет ИЛИ старая передача уже закрыта (завершена), создаем новую
 	if !ok {
 		pr, pw := io.Pipe()
 		t = &Transfer{pr: pr, pw: pw}
@@ -261,16 +266,35 @@ func handleStream(w http.ResponseWriter, r *http.Request) {
 	mu.Unlock()
 
 	if r.Method == "POST" {
-		// ОТПРАВИТЕЛЬ льет данные в PipeWriter
-		io.Copy(t.pw, r.Body)
+		// ОТПРАВИТЕЛЬ: Копируем данные из тела запроса в PipeWriter
+		// io.Copy будет висеть, пока получатель не начнет читать из PipeReader
+		_, err := io.Copy(t.pw, r.Body)
+		if err != nil {
+			fmt.Println("Ошибка отправки:", err)
+		}
+
+		// ВАЖНО: Закрываем только после завершения копирования
 		t.pw.Close()
+
+		// Чистим карту ТОЛЬКО после того, как данные полностью ушли
 		mu.Lock()
 		delete(transfers, id)
 		mu.Unlock()
+
 	} else {
-		// ПОЛУЧАТЕЛЬ читает данные из PipeReader
+		// ПОЛУЧАТЕЛЬ: Настраиваем заголовки для скачивания
 		w.Header().Set("Content-Disposition", "attachment; filename="+r.URL.Query().Get("name"))
 		w.Header().Set("Content-Length", r.URL.Query().Get("size"))
-		io.Copy(w, t.pr)
+
+		// Копируем из PipeReader прямо в HTTP ответ
+		_, err := io.Copy(w, t.pr)
+		if err != nil {
+			fmt.Println("Ошибка получения:", err)
+		}
+
+		// На всякий случай чистим и тут
+		mu.Lock()
+		delete(transfers, id)
+		mu.Unlock()
 	}
 }
