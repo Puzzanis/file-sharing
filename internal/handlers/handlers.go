@@ -1,11 +1,13 @@
 package handlers
 
 import (
+	"file-sharing/internal/db"
 	"file-sharing/internal/hub"
 	"file-sharing/internal/transfer"
 	"fmt"
 	"io"
 	"net/http"
+	"strconv"
 
 	"github.com/gorilla/websocket"
 )
@@ -68,6 +70,13 @@ func HandleStream(w http.ResponseWriter, r *http.Request) {
 		t.Pw.Close()
 		transfer.Delete(id)
 	} else {
+		// ИЗВЛЕКАЕМ ДАННЫЕ ДЛЯ БД И УВЕДОМЛЕНИЙ
+		senderID := r.URL.Query().Get("from")
+		fileName := r.URL.Query().Get("name")
+		sizeStr := r.URL.Query().Get("size")
+
+		// Конвертируем размер из строки в int64 для БД
+		fileSizeInt, _ := strconv.ParseInt(sizeStr, 10, 64)
 		//Указываем, что это скачивание файла
 		w.Header().Set("Content-Disposition", "attachment; filename="+r.URL.Query().Get("name"))
 		//Указываем точный размер (КРИТИЧНО для прогресс-бара)
@@ -76,13 +85,24 @@ func HandleStream(w http.ResponseWriter, r *http.Request) {
 		// Для скачивания тоже используем буфер 1МБ
 		_, err := io.CopyBuffer(w, t.Pr, buf)
 		if err == nil {
+			//Записываем в SQLite
+			db.LogTransfer(senderID, id, fileName, fileSizeInt)
+
+			// Уведомляем отправителя и получателя о завершении
 			hub.Mu.Lock()
-			// 1. Уведомляем Отправителя (его ID берем из параметра from)
+			if conn, ok := hub.Clients[senderID]; ok {
+				conn.WriteJSON(map[string]string{"type": "complete"})
+			}
+			if conn, ok := hub.Clients[id]; ok {
+				conn.WriteJSON(map[string]string{"type": "complete"})
+			}
+
+			//Уведомляем Отправителя (его ID берем из параметра from)
 			senderID := r.URL.Query().Get("from")
 			if conn, ok := hub.Clients[senderID]; ok {
 				conn.WriteJSON(map[string]string{"type": "complete"})
 			}
-			// 2. Уведомляем Получателя (его ID берем из параметра to)
+			//Уведомляем Получателя (его ID берем из параметра to)
 			receiverID := r.URL.Query().Get("to")
 			if conn, ok := hub.Clients[receiverID]; ok {
 				conn.WriteJSON(map[string]string{"type": "complete"})

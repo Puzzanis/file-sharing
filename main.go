@@ -1,6 +1,7 @@
 package main
 
 import (
+	"file-sharing/internal/db"
 	"fmt"
 	"net/http"
 
@@ -8,6 +9,11 @@ import (
 )
 
 func main() {
+	db.InitDB() // Инициализация SQLite
+	defer db.DB.Close()
+
+	db.PrintStats()
+
 	fs := http.FileServer(http.Dir("./ui"))
 	http.Handle("/", fs)
 
