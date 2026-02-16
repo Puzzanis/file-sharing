@@ -28,6 +28,18 @@ ws.onmessage = (e) => {
         document.getElementById('status').innerText = "Ваш ID: " + myId;
     }
 
+    if (d.type === 'decline') {
+        document.getElementById('status').innerText = `❌ ${d.from} отклонил файл "${d.name}"`;
+        // Очищаем статус через 5 секунд
+        setTimeout(() => {
+            document.getElementById('status').innerText = "Ваш ID: " + myId;
+        }, 5000);
+
+        // ВАЖНО: Если у нас висит XHR запрос, его желательно прервать,
+        // но так как мы используем стриминг, сервер сам закроет трубу,
+        // когда увидит, что получатель так и не пришел.
+    }
+
     if(d.type === 'list') {
         const listDiv = document.getElementById('list');
         listDiv.innerHTML = "";
@@ -91,20 +103,28 @@ function reply(ok) {
     const notif = document.getElementById('notif');
     notif.style.display = 'none';
 
-    if(ok && currentOffer) {
-        ws.send(JSON.stringify({type: 'accept', to: currentOffer.from}));
+    if(currentOffer) {
+        if (ok) {
+            ws.send(JSON.stringify({type: 'accept', to: currentOffer.from}));
 
-        // ПРОВЕРЬ: добавлен &from=${currentOffer.from}
-        const url = `/stream?to=${myId}&from=${currentOffer.from}&name=${encodeURIComponent(currentOffer.name)}&size=${currentOffer.size}`;
+            const url = `/stream?to=${myId}&from=${currentOffer.from}&name=${encodeURIComponent(currentOffer.name)}&size=${currentOffer.size}`;
 
-        const a = document.createElement('a');
-        a.href = url;
-        a.download = currentOffer.name;
-        document.body.appendChild(a);
-        a.click();
-        document.body.removeChild(a);
+            const a = document.createElement('a');
+            a.href = url;
+            a.download = currentOffer.name;
+            document.body.appendChild(a);
+            a.click();
+            document.body.removeChild(a);
 
-        document.getElementById('status').innerText = "📥 Получение файла...";
+            document.getElementById('status').innerText = "📥 Получение файла...";
+        }else{
+            ws.send(JSON.stringify({
+                type: 'decline',
+                to: currentOffer.from,
+                name: currentOffer.name
+            }));
+            document.getElementById('status').innerText = "Вы отклонили файл.";
+        }
     }
     currentOffer = null;
 }

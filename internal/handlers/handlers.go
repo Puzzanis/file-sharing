@@ -56,61 +56,47 @@ func HandleWS(w http.ResponseWriter, r *http.Request) {
 // HandleStream управляет передачей файлов
 func HandleStream(w http.ResponseWriter, r *http.Request) {
 	id := r.URL.Query().Get("to")
-	t := transfer.GetOrCreate(id)
+	senderID := r.URL.Query().Get("from")
+	fileName := r.URL.Query().Get("name")
+	sizeStr := r.URL.Query().Get("size")
 
-	// Создаем буфер 1МБ для ускорения передачи
+	// Получаем или создаем трубу
+	t := transfer.GetOrCreate(id)
 	buf := make([]byte, 1024*1024)
 
 	if r.Method == http.MethodPost {
-		// Используем CopyBuffer вместо обычного Copy
+		// ОТПРАВИТЕЛЬ
 		_, err := io.CopyBuffer(t.Pw, r.Body, buf)
+		t.Pw.Close() // Обязательно закрываем, чтобы получатель узнал о конце файла
 		if err != nil {
 			fmt.Println("Ошибка POST:", err)
 		}
-		t.Pw.Close()
-		transfer.Delete(id)
 	} else {
-		// ИЗВЛЕКАЕМ ДАННЫЕ ДЛЯ БД И УВЕДОМЛЕНИЙ
-		senderID := r.URL.Query().Get("from")
-		fileName := r.URL.Query().Get("name")
-		sizeStr := r.URL.Query().Get("size")
+		// ПОЛУЧАТЕЛЬ
+		w.Header().Set("Content-Disposition", "attachment; filename="+fileName)
+		w.Header().Set("Content-Length", sizeStr)
+		w.Header().Set("Content-Type", "application/octet-stream")
 
-		// Конвертируем размер из строки в int64 для БД
-		fileSizeInt, _ := strconv.ParseInt(sizeStr, 10, 64)
-		//Указываем, что это скачивание файла
-		w.Header().Set("Content-Disposition", "attachment; filename="+r.URL.Query().Get("name"))
-		//Указываем точный размер (КРИТИЧНО для прогресс-бара)
-		w.Header().Set("Content-Length", r.URL.Query().Get("size"))
-
-		// Для скачивания тоже используем буфер 1МБ
 		_, err := io.CopyBuffer(w, t.Pr, buf)
+
+		// После того как CopyBuffer закончил работу (файл передан)
 		if err == nil {
-			//Записываем в SQLite
+			// Логируем в БД
+			fileSizeInt, _ := strconv.ParseInt(sizeStr, 10, 64)
 			db.LogTransfer(senderID, id, fileName, fileSizeInt)
 
-			// Уведомляем отправителя и получателя о завершении
+			// Уведомляем участников через WebSocket
 			hub.Mu.Lock()
-			if conn, ok := hub.Clients[senderID]; ok {
-				conn.WriteJSON(map[string]string{"type": "complete"})
+			if senderConn, ok := hub.Clients[senderID]; ok {
+				senderConn.WriteJSON(map[string]string{"type": "complete"})
 			}
-			if conn, ok := hub.Clients[id]; ok {
-				conn.WriteJSON(map[string]string{"type": "complete"})
-			}
-
-			//Уведомляем Отправителя (его ID берем из параметра from)
-			senderID := r.URL.Query().Get("from")
-			if conn, ok := hub.Clients[senderID]; ok {
-				conn.WriteJSON(map[string]string{"type": "complete"})
-			}
-			//Уведомляем Получателя (его ID берем из параметра to)
-			receiverID := r.URL.Query().Get("to")
-			if conn, ok := hub.Clients[receiverID]; ok {
-				conn.WriteJSON(map[string]string{"type": "complete"})
+			if receiverConn, ok := hub.Clients[id]; ok {
+				receiverConn.WriteJSON(map[string]string{"type": "complete"})
 			}
 			hub.Mu.Unlock()
 		}
 
-		// Очищаем передачу после завершения
+		// Очищаем передачу ТОЛЬКО после того, как получатель закончил чтение
 		transfer.Delete(id)
 	}
 }
